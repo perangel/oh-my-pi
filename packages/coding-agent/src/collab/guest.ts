@@ -19,6 +19,14 @@
  * transcript behavior are native by construction.
  */
 import * as path from "node:path";
+import {
+	MANAGED_COLLAB_VERSION,
+	isManagedCollabId,
+	type ManagedCollabRequest,
+	type ManagedCollabTurn,
+} from "@oh-my-pi/pi-wire";
+import type { BoundCollabGuestOptions } from "./bound-types";
+import { sameManagedIdentity } from "./managed";
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { getConfigRootDir, logger } from "@oh-my-pi/pi-utils";
@@ -80,6 +88,7 @@ type SnapshotChunkFrame = Extract<CollabFrame, { t: "snapshot-chunk" }>;
 
 /** Accumulator for an in-flight chunked welcome — see {@link CollabGuestLink}. */
 interface PendingSnapshot {
+	connection: number;
 	header: WelcomeFrame["header"];
 	state: WelcomeFrame["state"];
 	agents: AgentSnapshot[];
@@ -164,6 +173,17 @@ export function reconcileGuestSnapshotHostState(ctx: GuestSnapshotActivityReconc
 
 export class CollabGuestLink {
 	#ctx: InteractiveModeContext;
+	readonly #bound: BoundCollabGuestOptions | undefined;
+	#connection = 0;
+	#reconnectTimer: Timer | undefined;
+	#lastDraft: { requestId: string; text: string } | undefined;
+	get bound(): boolean {
+		return this.#bound !== undefined;
+	}
+	/** True only after a complete native snapshot has been activated on the current connection. */
+	get connected(): boolean {
+		return this.#welcomed && !this.#left;
+	}
 	#socket: CollabSocket | null = null;
 	#roomId = "";
 	/** Previous session file to restore on leave; null = previous session was unsaved. */
@@ -258,14 +278,66 @@ export class CollabGuestLink {
 		return true;
 	}
 
-	constructor(ctx: InteractiveModeContext) {
+	constructor(ctx: InteractiveModeContext, bound?: BoundCollabGuestOptions) {
 		this.#ctx = ctx;
+		this.#bound = bound && Object.freeze({ ...bound, expected: Object.freeze({ ...bound.expected }) });
+		if (bound) {
+			ctx.session.disableLocalExecution();
+			ctx.collabGuest = this;
+		}
+	}
+
+	/** Bound input is handled before any slash, shell, skill or queue expansion. */
+	async submitBoundInput(text: string): Promise<void> {
+		if (!this.#bound) throw new Error("Not a bound guest");
+		text = text.trim();
+		if (text === "/leave" || text === "/exit" || text === "/quit") {
+			await this.leave("left");
+			return;
+		}
+		if (!text || text.startsWith("/") || text.startsWith("!") || text.startsWith(">")) {
+			this.#ctx.showStatus("Local commands and queues are disabled in this bound session");
+			return;
+		}
+		await this.submitRequest({ requestId: crypto.randomUUID(), text, expected: this.#bound.expected });
+	}
+
+	async submitRequest(request: ManagedCollabRequest): Promise<void> {
+		if (!isManagedCollabId(request.requestId) || typeof request.text !== "string")
+			throw new Error("Invalid bound request");
+		const bound = this.#bound;
+		if (!bound || this.#left || !this.#welcomed || !sameManagedIdentity(request.expected, bound.expected)) {
+			throw new Error("Bound session unavailable or mismatched");
+		}
+		const envelope = Object.freeze({ ...request, expected: Object.freeze({ ...bound.expected }) });
+		const connection = this.#connection;
+		await bound.beforeSend(envelope);
+		// Never queue/replay a submission that lost its connection during outbox persistence.
+		if (this.#left || !this.#welcomed || connection !== this.#connection)
+			throw new Error("Bound session disconnected before send");
+		this.#lastDraft = { requestId: envelope.requestId, text: envelope.text };
+		this.#socket?.send({ t: "managed-prompt", request: envelope });
+	}
+
+	lookupRequest(requestId: string): void {
+		if (!isManagedCollabId(requestId)) throw new Error("Invalid bound request identity");
+		if (!this.#bound || this.#left || !this.#welcomed) throw new Error("Bound session unavailable");
+		this.#socket?.send({ t: "managed-lookup", requestId, expected: this.#bound.expected });
+	}
+
+	cancelRequest(target: ManagedCollabTurn): void {
+		if (!isManagedCollabId(target.requestId) || !isManagedCollabId(target.turnId))
+			throw new Error("Invalid bound turn identity");
+		if (!this.#bound || this.#left || !this.#welcomed) throw new Error("Bound session unavailable");
+		this.#socket?.send({ t: "managed-cancel", ...target, expected: this.#bound.expected });
 	}
 
 	async join(link: string): Promise<void> {
+		if (this.#bound && (this.#socket || link !== this.#bound.link)) throw new Error("Bound capability cannot change");
 		const parsed = parseCollabLink(link);
 		if ("error" in parsed) throw new Error(parsed.error);
-		if (this.#ctx.collabGuest || this.#left) throw new Error("Already in a collab session (/leave first)");
+		if ((this.#ctx.collabGuest && this.#ctx.collabGuest !== this) || this.#left)
+			throw new Error("Already in a collab session (/leave first)");
 		this.#roomId = parsed.roomId;
 		this.#writeToken = parsed.writeToken ? Buffer.from(parsed.writeToken).toString("base64url") : undefined;
 		this.#returnSessionFile = this.#ctx.sessionManager.getSessionFile() ?? null;
@@ -294,6 +366,8 @@ export class CollabGuestLink {
 		};
 
 		socket.onOpen = () => {
+			this.#connection++;
+			if (this.#bound) socket.discardPendingSends();
 			if (this.#left) return;
 			// (Re)connect: re-introduce ourselves; the host answers with a fresh
 			// welcome which (re)syncs the replica. Discard any partially-streamed
@@ -308,26 +382,47 @@ export class CollabGuestLink {
 				proto: COLLAB_PROTO,
 				name: collabDisplayName(this.#ctx),
 				writeToken: this.#writeToken,
+				managed: this.#bound && {
+					version: MANAGED_COLLAB_VERSION,
+					expected: this.#bound.expected,
+					capability: this.#bound.capability,
+				},
 			});
 		};
 		socket.onFrame = frame => {
+			// The transport authenticates a room's final goodbye even after its socket closes.
+			// Withdraw now; restoration still drains any in-flight snapshot before local resume.
+			if (frame.t === "bye") {
+				if (!this.#left) this.#applyFrame(frame);
+				return;
+			}
+			// Decryption may finish after close but before the transport reconnects.
+			if (!socket.isOpen) return;
+			const connection = this.#connection;
 			this.#applyChain = this.#applyChain
 				.then(async () => {
-					if (this.#left) return;
+					if (this.#left || connection !== this.#connection) return;
 					if (frame.t === "welcome") {
+						if (
+							this.#bound &&
+							(!frame.managed ||
+								frame.managed.version !== MANAGED_COLLAB_VERSION ||
+								!sameManagedIdentity(frame.managed.identity, this.#bound.expected) ||
+								frame.header.id !== this.#bound.expected.sessionId)
+						) {
+							throw new Error("Managed collaboration version or binding mismatch");
+						}
 						this.#clearWelcomeTimer();
 						this.#beginWelcome(frame, joined);
 						if (frame.entryCount === 0) {
-							await this.#finalizeSnapshot();
-							finishJoin();
+							if (await this.#finalizeSnapshot()) finishJoin();
 						}
 						return;
 					}
 					if (frame.t === "snapshot-chunk") {
 						const ready = this.#accumulateSnapshotChunk(frame);
 						if (ready) {
-							await this.#finalizeSnapshot();
-							finishJoin();
+							if (await this.#finalizeSnapshot()) finishJoin();
 						}
 						return;
 					}
@@ -345,7 +440,16 @@ export class CollabGuestLink {
 					this.#applyFrame(frame);
 				})
 				.catch(err => {
-					logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
+					if (this.#left || connection !== this.#connection) return;
+					logger.warn("collab guest frame apply failed", {
+						type: frame.t,
+						error: this.#bound ? "bound callback or frame failed" : String(err),
+					});
+					if (this.#bound) {
+						if (!joined) firstWelcome.reject(new Error("Bound collaboration frame failed"));
+						else this.#restoreAfterDisconnect();
+						return;
+					}
 					if (frame.t === "welcome" || frame.t === "snapshot-chunk") {
 						if (!joined) firstWelcome.reject(err instanceof Error ? err : new Error(String(err)));
 						else this.#restoreAfterDisconnect();
@@ -353,6 +457,18 @@ export class CollabGuestLink {
 				});
 		};
 		socket.onClose = (reason, willReconnect) => {
+			this.#connection++;
+			this.#welcomed = false;
+			this.#pendingSnapshot = null;
+			if (this.#bound) {
+				socket.discardPendingSends();
+				if (joined && !this.#left && !this.#reconnectTimer) {
+					this.#reconnectTimer = setTimeout(
+						() => this.#restoreAfterDisconnect(),
+						this.#bound.reconnectTimeoutMs ?? 30_000,
+					);
+				}
+			}
 			this.#clearWelcomeTimer();
 			this.#clearSnapshotProgressTimer();
 			this.#flushPendingTranscripts();
@@ -395,11 +511,27 @@ export class CollabGuestLink {
 	}
 
 	sendPrompt(text: string, images?: ImageContent[]): void {
+		if (this.#bound) {
+			if (images?.length) {
+				this.#ctx.showStatus("Bound guest accepts text only");
+				return;
+			}
+			void this.submitBoundInput(text).catch(() =>
+				this.#ctx.showError("Bound request not sent; inspect its receipt before retrying"),
+			);
+			return;
+		}
 		if (this.#rejectReadOnly()) return;
 		this.#socket?.send({ t: "prompt", text, images: images && images.length > 0 ? images : undefined });
 	}
 
 	sendAbort(): void {
+		if (this.#bound) {
+			const active = this.state?.activeTurn;
+			if (!active || this.#left || !this.#welcomed) return;
+			this.cancelRequest(active);
+			return;
+		}
 		if (this.#rejectReadOnly()) return;
 		this.#socket?.send({ t: "abort" });
 	}
@@ -413,6 +545,7 @@ export class CollabGuestLink {
 	#beginWelcome(frame: WelcomeFrame, isResync: boolean): void {
 		if (this.#left) return;
 		this.#pendingSnapshot = {
+			connection: this.#connection,
 			header: frame.header,
 			state: frame.state,
 			agents: frame.agents,
@@ -447,23 +580,24 @@ export class CollabGuestLink {
 	}
 
 	/** Write the accumulated welcome snapshot to the replica file and (re)load it through the resume machinery. */
-	async #finalizeSnapshot(): Promise<void> {
+	async #finalizeSnapshot(): Promise<boolean> {
 		const pending = this.#pendingSnapshot;
 		this.#pendingSnapshot = null;
 		this.#clearSnapshotProgressTimer();
-		if (!pending || this.#left) return;
+		if (!pending || this.#left || pending.connection !== this.#connection) return false;
 		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}.jsonl`);
 		const lines = [pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
 		await Bun.write(replicaPath, `${lines}\n`);
-		if (this.#left) return;
+		if (this.#left || pending.connection !== this.#connection) return false;
 
 		// Resume through AgentSession without adopting the host's cwd.
 		const switched = await this.#ctx.session.switchSession(replicaPath, { preserveLocalCwd: true });
+		// Even a stale switch must be restored when an unbound guest leaves.
+		if (switched !== false) this.#replicaActivated = true;
+		if (this.#left || pending.connection !== this.#connection) return false;
 		if (switched === false) {
 			throw new Error("Collab replica activation was cancelled");
 		}
-		this.#replicaActivated = true;
-		if (this.#left) return;
 		const orphanedLiveBlocks = [
 			...this.#ctx.pendingTools.values(),
 			...this.#ctx.eventController.takeDisplaceableComponents(),
@@ -507,16 +641,21 @@ export class CollabGuestLink {
 			}
 			throw err;
 		}
-		if (this.#left) return;
+		if (this.#left || pending.connection !== this.#connection) return false;
 		await this.#ctx.reloadTodos();
-		if (this.#left) return;
+		if (this.#left || pending.connection !== this.#connection) return false;
 		this.#updateStatusSegment();
 		this.#readOnly = pending.readOnly;
 		this.#welcomed = true;
+		clearTimeout(this.#reconnectTimer);
+		this.#reconnectTimer = undefined;
+		if (this.#bound) this.#bound.onSnapshot?.(this.#bound.expected);
+		if (this.#left || pending.connection !== this.#connection) return false;
 		const suffix = this.#readOnly ? " (read-only)" : "";
 		this.#ctx.showStatus(
 			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 		);
+		return true;
 	}
 
 	#armWelcomeTimer(): void {
@@ -553,6 +692,18 @@ export class CollabGuestLink {
 
 	#applyFrame(frame: CollabFrame): void {
 		switch (frame.t) {
+			case "managed-receipt":
+				if (
+					frame.receipt.phase === "rejected" &&
+					this.#lastDraft?.requestId === frame.receipt.requestId &&
+					!this.#ctx.editor.getText()
+				) {
+					this.#ctx.editor.setText(this.#lastDraft.text);
+				}
+				this.#bound?.onReceipt(frame.receipt);
+				if (frame.receipt.phase === "rejected")
+					this.#ctx.showStatus(`Request rejected: ${frame.receipt.code ?? "denied"}`);
+				break;
 			case "entry": {
 				// Entries are never rendered directly — rendering is events-only
 				// (prevents double-render). They keep the replica file, the agent's
@@ -573,6 +724,7 @@ export class CollabGuestLink {
 			}
 			case "event":
 				this.#applyEvent(frame.event);
+				this.#bound?.onEvent?.(frame.event, frame.managed);
 				break;
 			case "state": {
 				this.state = frame.state;
@@ -623,15 +775,13 @@ export class CollabGuestLink {
 	}
 
 	#applyEvent(event: AgentSessionEvent): void {
-		// Orphan-delta guard: when joining mid-turn the message_start for the
-		// in-flight assistant message predates the snapshot. message_update
-		// carries the full accumulating message, so synthesize the missing start
-		// before the first orphaned update; every other handler is tolerant of
-		// unknown anchors (guarded by streamingComponent/pendingTools lookups).
+		// A mid-turn snapshot omits the in-flight assistant message. Both updates
+		// and completion carry its full content: completion must establish a native
+		// component too when no further update reaches the newly joined guest.
 		if (event.type === "message_start" && event.message.role === "assistant") {
 			this.#assistantStreamSynced = true;
 		} else if (
-			event.type === "message_update" &&
+			(event.type === "message_update" || event.type === "message_end") &&
 			event.message.role === "assistant" &&
 			!this.#assistantStreamSynced
 		) {
@@ -835,6 +985,29 @@ export class CollabGuestLink {
 	}
 
 	#restoreLocalSession(): Promise<boolean> {
+		if (this.#bound) {
+			if (this.#restoration) return this.#restoration;
+			this.#left = true;
+			this.#welcomed = false;
+			clearTimeout(this.#reconnectTimer);
+			this.#joinReject?.(new Error("Bound session closed"));
+			this.#clearWelcomeTimer();
+			this.#clearSnapshotProgressTimer();
+			this.#socket?.discardPendingSends();
+			this.#socket?.close();
+			this.#socket = null;
+			this.#clearTransientUi();
+			this.#flushPendingTranscripts();
+			// Keep collabGuest claimed forever, including partial startup and callback failure.
+			// A replica switch already in progress must finish before session disposal.
+			this.#restoration = this.#applyChain.then(() => false);
+			try {
+				this.#bound.onClosed();
+			} catch {
+				logger.warn("Bound collaboration close callback failed");
+			}
+			return this.#restoration;
+		}
 		if (this.#restoration) return this.#restoration;
 		this.#left = true;
 		this.#joinReject?.(new Error("Collab join cancelled"));
@@ -895,6 +1068,7 @@ export class CollabGuestLink {
 	}
 
 	#updateStatusSegment(): void {
+		if (this.#bound) this.#ctx.setHookStatus("bound-scope", this.#bound.label);
 		this.#ctx.statusLine.setCollabStatus({
 			role: "guest",
 			participantCount: this.state?.participants.length ?? 1,

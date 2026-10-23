@@ -10,6 +10,14 @@
  */
 
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import {
+	MANAGED_COLLAB_VERSION,
+	isManagedCollabId,
+	type ManagedCollabHello,
+	type ManagedCollabIdentity,
+	type ManagedCollabReceipt,
+} from "@oh-my-pi/pi-wire";
+import { type ManagedCollabAdmission, sameManagedIdentity } from "./managed";
 import * as fs from "node:fs/promises";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -151,6 +159,8 @@ interface PendingCollabUiRequest {
  * room (the room itself always carries a write token for its own links).
  */
 export interface CollabHostOptions {
+	/** Opt-in admission/receipt owner; raw remote actions are denied in this mode. */
+	managed?: ManagedCollabAdmission;
 	instanceId?: string;
 	generation?: number;
 	access?: CollabAccess;
@@ -197,6 +207,8 @@ export class CollabHost {
 	readonly #guestActionsReady: () => boolean;
 	readonly #onEnded: (() => void) | undefined;
 	readonly #access: CollabAccess;
+	readonly #managed: ManagedCollabAdmission | undefined;
+	#authAttempts = new Map<number, symbol>();
 	#relayConnected = false;
 	#registryPublication: CollabHostPublication | null = null;
 	/** Publication still being created; teardown awaits and withdraws it. */
@@ -241,6 +253,7 @@ export class CollabHost {
 		this.#access = options.access ?? "control";
 		this.#guestActionsReady = options.guestActionsReady ?? (() => true);
 		this.#onEnded = options.onEnded;
+		this.#managed = options.managed;
 		// The room mirrors the session that is active when it is created; the
 		// frame guard and the registry snapshot compare against this from then on.
 		this.#sessionId = ctx.sessionManager.getSessionId();
@@ -264,6 +277,23 @@ export class CollabHost {
 	/** Session this room mirrors; fixed at `start()`. */
 	get sessionId(): string {
 		return this.#sessionId;
+	}
+
+	get managedIdentity(): ManagedCollabIdentity | undefined {
+		return (
+			this.#managed && {
+				...this.#managed.binding,
+				sessionId: this.sessionId,
+				instanceId: this.instanceId,
+				generation: this.generation,
+			}
+		);
+	}
+
+	/** Withdraw admission and await the native turn, journal flush and embedder settlement. */
+	async settle(): Promise<void> {
+		await this.#managed?.stop();
+		await this.#ctx.sessionManager.flush();
 	}
 
 	get stopped(): boolean {
@@ -330,6 +360,7 @@ export class CollabHost {
 	 * must stay local rather than reach the previous session's guests.
 	 */
 	requestGuestUi(request: CollabUiRequestDraft, signal?: AbortSignal): Promise<CollabGuestUiResult> | null {
+		if (this.#managed) return null;
 		if (!this.#guestTrafficAllowed() || signal?.aborted || this.#pendingUi.size >= MAX_PENDING_UI_REQUESTS)
 			return null;
 		const reqId = ++this.#uiReqSeq;
@@ -437,7 +468,8 @@ export class CollabHost {
 		// resolves), and anything that happens after its welcome snapshot must
 		// reach it; the local registry work below is independent of that.
 		this.#unsubscribe = this.#ctx.session.subscribe(event => {
-			if (isWireAgentEvent(event)) this.#send({ t: "event", event: shrinkReplicatedEvent(event) });
+			if (isWireAgentEvent(event))
+				this.#send({ t: "event", event: shrinkReplicatedEvent(event), managed: this.#managed?.activeTurn });
 			this.#onEventForState(event);
 		});
 		// Subagent frames publish on the session tree's observability bus at
@@ -516,6 +548,7 @@ export class CollabHost {
 
 	async #runStop(reason: string): Promise<void> {
 		this.#stopping = true;
+		this.#managed?.withdraw();
 		// Leave the public slot at once: `/collab` must not re-print, and `/join`
 		// must not see as hosting, a room that already refuses frames.
 		if (this.#ctx.collabHost === this) this.#ctx.collabHost = undefined;
@@ -540,6 +573,7 @@ export class CollabHost {
 	async #runTeardown(): Promise<void> {
 		if (this.#stopped) return;
 		this.#stopped = true;
+		this.#managed?.withdraw();
 		// A room that ended on its own (fatal relay close) reaches here without
 		// `#runStop`: leave the public slot before the first await as well.
 		if (this.#ctx.collabHost === this) this.#ctx.collabHost = undefined;
@@ -651,16 +685,30 @@ export class CollabHost {
 		// current-session data. Do not strand guests if it settles during a
 		// provisional /resume that later rolls back. All other traffic stays gated.
 		if (this.ending || (!this.#sessionStillCurrent() && frame.t !== "ui-request-end")) return;
-		this.#socket?.send(frame, toPeer);
+		if (this.#managed && (frame.t === "bus" || frame.t === "agents" || frame.t === "ui-request")) return;
+		if (this.#managed && toPeer === 0) {
+			for (const peer of this.#peers.keys()) this.#socket?.send(frame, peer);
+		} else this.#socket?.send(frame, toPeer);
 	}
 
 	#handleFrame(frame: CollabFrame, fromPeer: number): void {
+		if (!frame || typeof frame !== "object" || Array.isArray(frame) || typeof frame.t !== "string") {
+			logger.debug("collab host ignoring malformed frame", { fromPeer });
+			return;
+		}
 		// Controls are dispatched synchronously while frames finish decrypting, so
 		// a hello can land after its sender's `peer-left`. The socket settled the
 		// peer's lifetime at reception; re-read it here rather than acting on a
 		// sender that is already gone and registering a ghost participant.
 		if (!this.#socket?.isServing(fromPeer)) {
 			logger.debug("collab host ignoring frame from a peer it no longer serves", { type: frame.t, fromPeer });
+			return;
+		}
+		if (this.#managed) {
+			void this.#handleManagedFrame(frame, fromPeer).catch(() => {
+				// A failed reply must not escape as a process-fatal rejection or leak policy secrets.
+				logger.warn("collab managed frame handling failed", { fromPeer });
+			});
 			return;
 		}
 		// An old-room answer may wait for rollback, but cannot settle against
@@ -694,6 +742,89 @@ export class CollabHost {
 				break;
 			default:
 				logger.debug("collab host ignoring unexpected frame", { type: frame.t, fromPeer });
+		}
+	}
+
+	async #handleManagedFrame(frame: CollabFrame, peer: number): Promise<void> {
+		const managed = this.#managed;
+		const identity = this.managedIdentity;
+		if (!managed || !identity || !this.#guestTrafficAllowed()) return;
+		try {
+			if (frame.t === "hello") {
+				if (this.#authAttempts.has(peer)) throw new Error("peer already introduced");
+				const hello: ManagedCollabHello | undefined = frame.managed;
+				if (
+					!hello ||
+					hello.version !== MANAGED_COLLAB_VERSION ||
+					typeof hello.capability !== "string" ||
+					!hello.capability ||
+					!sameManagedIdentity(hello.expected, identity) ||
+					!this.#verifyWriteToken(frame.writeToken)
+				) {
+					this.#send({ t: "error", message: "Managed collaboration capability or binding mismatch" }, peer);
+					return;
+				}
+				const attempt = Symbol();
+				this.#authAttempts.set(peer, attempt);
+				await managed.authenticate(peer, hello.capability, identity);
+				if (
+					this.#authAttempts.get(peer) !== attempt ||
+					!this.#socket?.isServing(peer) ||
+					!this.#guestTrafficAllowed()
+				) {
+					managed.forget(peer);
+					return;
+				}
+				this.#handleHello(frame.name, frame.proto, frame.writeToken, peer);
+				return;
+			}
+			if (!this.#peers.has(peer)) throw new Error("authentication required");
+			if (frame.t !== "managed-prompt" && frame.t !== "managed-lookup" && frame.t !== "managed-cancel") {
+				this.#send({ t: "error", message: "Remote action denied by managed host" }, peer);
+				return;
+			}
+			const expected = frame.t === "managed-prompt" ? frame.request?.expected : frame.expected;
+			const requestId = frame.t === "managed-prompt" ? frame.request?.requestId : frame.requestId;
+			if (!isManagedCollabId(requestId)) {
+				this.#send({ t: "error", message: "Invalid managed request identity" }, peer);
+				return;
+			}
+			if (
+				(frame.t === "managed-prompt" && typeof frame.request.text !== "string") ||
+				(frame.t === "managed-cancel" && !isManagedCollabId(frame.turnId))
+			) {
+				this.#send(
+					{ t: "managed-receipt", receipt: { requestId, phase: "rejected", code: "invalid-request" } },
+					peer,
+				);
+				return;
+			}
+			if (!expected || !sameManagedIdentity(expected, identity)) {
+				this.#send(
+					{ t: "managed-receipt", receipt: { requestId, phase: "rejected", code: "binding-mismatch" } },
+					peer,
+				);
+				return;
+			}
+			const notify = (receipt: ManagedCollabReceipt): void => {
+				this.#send({ t: "managed-receipt", receipt }, peer);
+				this.#scheduleStateBroadcast();
+			};
+			if (frame.t === "managed-lookup") notify(await managed.lookup(peer, frame.requestId));
+			else if (frame.t === "managed-cancel") notify(await managed.cancel(peer, frame));
+			else if (!this.#guestActionsReady()) notify({ requestId, phase: "rejected", code: "starting" });
+			else await managed.submit(peer, frame.request, notify);
+		} catch {
+			// Authentication/policy errors may contain opaque credentials. Never log their text.
+			const requestId =
+				frame.t === "managed-prompt"
+					? frame.request?.requestId
+					: frame.t === "managed-cancel" || frame.t === "managed-lookup"
+						? frame.requestId
+						: undefined;
+			if (typeof requestId === "string")
+				this.#send({ t: "managed-receipt", receipt: { requestId, phase: "unknown", code: "policy-failed" } }, peer);
+			else this.#send({ t: "error", message: "Managed collaboration request failed" }, peer);
 		}
 	}
 
@@ -769,14 +900,15 @@ export class CollabHost {
 				proto: COLLAB_PROTO,
 				header: snapshot.header,
 				state: this.#buildState(),
-				agents: this.#snapshotAgents(),
+				agents: this.#managed ? [] : this.#snapshotAgents(),
 				entryCount: entries.length,
 				readOnly: canWrite ? undefined : true,
+				managed: this.managedIdentity && { version: MANAGED_COLLAB_VERSION, identity: this.managedIdentity },
 			},
 			fromPeer,
 		);
 		socket.sendBatch(this.#snapshotChunks(entries), fromPeer);
-		if (canWrite) {
+		if (canWrite && !this.#managed) {
 			for (const pending of this.#pendingUi.values()) {
 				this.#send({ t: "ui-request", request: pending.request }, fromPeer);
 			}
@@ -961,6 +1093,8 @@ export class CollabHost {
 	 */
 	#handleRoomRecreated(): void {
 		if (this.#stopped) return;
+		for (const peer of this.#peers.keys()) this.#managed?.forget(peer);
+		this.#authAttempts.clear();
 		if (this.#peers.size === 0 && this.#pendingUi.size === 0) return;
 		// Identities first: settle() fans `ui-request-end` out over #peers, and those
 		// ids belong to the room that just went away.
@@ -979,6 +1113,8 @@ export class CollabHost {
 
 	/** Identity and UI only: the socket already retired the peer and dropped its backlog. */
 	#handlePeerLeft(peer: number): void {
+		this.#authAttempts.delete(peer);
+		this.#managed?.forget(peer);
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		// Relay controls arrive outside the normal frame handler.
@@ -997,6 +1133,7 @@ export class CollabHost {
 		const tokens = breakdown.usedTokens ?? 0;
 		return {
 			isStreaming: session.isStreaming,
+			activeTurn: this.#managed?.activeTurn,
 			isAborting: session.isAborting,
 			queuedMessageCount: session.queuedMessageCount,
 			sessionName: session.sessionName,

@@ -1,6 +1,7 @@
 import { HookEditorComponent, HookInputComponent, HookSelectorComponent } from "./modes/components";
 
 // Core session management
+export * from "./collab";
 
 export * as zod from "@oh-my-pi/omptype/zod";
 export { z } from "@oh-my-pi/omptype/zod";

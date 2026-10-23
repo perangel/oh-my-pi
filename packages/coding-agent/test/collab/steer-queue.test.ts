@@ -31,6 +31,7 @@ function startTestRelay(): { url: string; stop(): void } {
 	const guests = new Map<number, RelaySocket>();
 	let nextPeerId = 1;
 	const server = Bun.serve({
+		hostname: "127.0.0.1",
 		port: 0,
 		fetch(req, srv): Response | undefined {
 			const role = new URL(req.url).searchParams.get("role") === "host" ? "host" : "guest";
@@ -72,7 +73,7 @@ function startTestRelay(): { url: string; stop(): void } {
 			},
 		},
 	});
-	return { url: `ws://localhost:${server.port}`, stop: () => server.stop(true) };
+	return { url: `ws://127.0.0.1:${server.port}`, stop: () => server.stop(true) };
 }
 
 interface CapturedPrompt {

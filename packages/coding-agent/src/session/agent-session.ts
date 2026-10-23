@@ -2724,6 +2724,22 @@ export class AgentSession implements SettingsScope {
 		return this.#hasPendingAsyncWake();
 	}
 
+	#localExecutionDisabled = false;
+
+	/** Irreversible replica-only latch. Native collaboration may still ingest/switch replicas. */
+	disableLocalExecution(): void {
+		if (this.isStreaming || this.hasAdmittedSubmission) throw new Error("Cannot bind an executing session");
+		this.#localExecutionDisabled = true;
+		this.agent.setTools([]);
+		this.agent.streamFn = () => {
+			throw new Error("Local inference is disabled for this replica");
+		};
+	}
+
+	#assertLocalExecution(): void {
+		if (this.#localExecutionDisabled) throw new Error("Local execution is disabled for this replica");
+	}
+
 	/** True while a submission has been admitted but has not yet started a turn, queued, or bailed. */
 	get hasAdmittedSubmission(): boolean {
 		return this.#admittedSubmissionCount > 0;
@@ -2737,6 +2753,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #admitSubmission<T>(work: () => Promise<T>): Promise<T> {
+		this.#assertLocalExecution();
 		this.#admittedSubmissionCount++;
 		try {
 			return await work();
@@ -10243,6 +10260,7 @@ export class AgentSession implements SettingsScope {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions },
 	): Promise<BashResult> {
+		this.#assertLocalExecution();
 		return this.#bash.executeBash(command, onChunk, options);
 	}
 
@@ -10282,6 +10300,7 @@ export class AgentSession implements SettingsScope {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean },
 	): Promise<PythonResult> {
+		this.#assertLocalExecution();
 		return this.#eval.executePython(code, onChunk, options);
 	}
 

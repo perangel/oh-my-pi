@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added the opt-in versioned managed collaboration handshake, opaque binding/request identities, receipts and turn-targeted cancellation contracts.
+
 ## [18.4.11] - 2026-10-02
 
 ### Added

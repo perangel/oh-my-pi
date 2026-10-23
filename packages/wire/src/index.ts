@@ -11,6 +11,15 @@
  * JSON boundary and every `switch` keeps a tolerant `default:` branch.
  */
 
+import type {
+	ManagedCollabGuestFrame,
+	ManagedCollabHello,
+	ManagedCollabHostFrame,
+	ManagedCollabIdentity,
+	ManagedCollabTurn,
+} from "./managed-collab";
+export * from "./managed-collab";
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Content blocks
 // ═══════════════════════════════════════════════════════════════════════════
@@ -172,6 +181,8 @@ export const COLLAB_PROMPT_MESSAGE_TYPE = "collab-prompt";
 /** `details` shape of `custom_message` entries with `customType === "collab-prompt"`. */
 export interface CollabPromptDetails {
 	from?: string;
+	managed?: ManagedCollabTurn;
+	expected?: ManagedCollabIdentity;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -233,6 +244,7 @@ export interface SessionState {
 	contextUsage?: ContextUsage;
 	participants: Participant[];
 	isAborting?: boolean;
+	activeTurn?: ManagedCollabTurn;
 }
 
 export interface AgentSnapshot {
@@ -326,6 +338,7 @@ export type CollabUiRequestDraft =
 export type CollabUiRequest = CollabUiRequestDraft & { reqId: number };
 
 export type GuestFrame =
+	| ManagedCollabGuestFrame
 	| {
 			t: "hello";
 			proto: number;
@@ -336,6 +349,7 @@ export type GuestFrame =
 			 * read-only and rejects their mutating frames.
 			 */
 			writeToken?: string;
+			managed?: ManagedCollabHello;
 	  }
 	| { t: "prompt"; text: string; images?: ImageContent[] }
 	| { t: "ui-response"; reqId: number; value?: CollabUiResponseValue }
@@ -347,6 +361,7 @@ export type GuestFrame =
 export type BusChannel = "task:subagent:progress" | "task:subagent:lifecycle";
 
 export type HostFrame =
+	| ManagedCollabHostFrame
 	| {
 			t: "welcome";
 			proto: number;
@@ -362,6 +377,7 @@ export type HostFrame =
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			managed?: { version: number; identity: ManagedCollabIdentity };
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Hosts split the
@@ -371,7 +387,7 @@ export type HostFrame =
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
-	| { t: "event"; event: AgentEvent }
+	| { t: "event"; event: AgentEvent; managed?: ManagedCollabTurn }
 	| { t: "state"; state: SessionState }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
 	| { t: "bus"; channel: BusChannel; data: unknown }

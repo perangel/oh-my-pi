@@ -16,6 +16,7 @@ import type { InteractiveModeContext } from "../modes/types";
 import { TRUNCATE_LENGTHS, truncateToWidth } from "@oh-my-pi/pi-tui/render/render-utils";
 import { CollabHost, CollabHostStoppedError } from "./host";
 import type { CollabAccess } from "./registry";
+import type { ManagedCollabAdmission } from "./managed";
 
 import { cfgCollabAutoStart, cfgCollabRelayUrl, cfgCollabWebUrl } from "./settings";
 
@@ -34,12 +35,14 @@ export interface CollabStartOptions {
 	access: CollabAccess;
 	/** Relay override (`host[:port]` or a full URL); defaults to `collab.relayUrl`. */
 	relay?: string;
+	managed?: ManagedCollabAdmission;
 }
 
 export class CollabController {
 	readonly instanceId: string;
 	#ctx: InteractiveModeContext;
 	#generation = 0;
+	#managedMode = false;
 	#host: CollabHost | undefined;
 	/** Serializes stop/start sequences so a rotation never interleaves with another. */
 	#ops: Promise<void> = Promise.resolve();
@@ -74,6 +77,7 @@ export class CollabController {
 	}
 
 	get autoStartMode(): CollabAutoStart {
+		if (this.#managedMode) return "off";
 		return cfgCollabAutoStart.get(this.#ctx.settings);
 	}
 
@@ -135,7 +139,10 @@ export class CollabController {
 	async start(options: CollabStartOptions): Promise<CollabHost> {
 		if (this.#shutdown) throw new CollabHostStoppedError("collab controller shut down");
 		if (this.#ctx.collabGuest) throw new CollabHostStoppedError("collab guest owns the session");
+		if (this.#managedMode && !options.managed) throw new Error("Managed controller cannot start an unbound room");
+		if (options.managed) this.#managedMode = true;
 		const existing = this.host;
+		if (options.managed && existing) throw new Error("Managed host requires a fresh room");
 		if (existing && (existing.access === "control" || options.access === "view")) return existing;
 		const stopEpoch = this.#stopEpoch;
 		// Abort an in-flight or stale room before queuing behind its startup.
@@ -148,9 +155,10 @@ export class CollabController {
 			// A preceding manual start or rotation may have installed a room while
 			// this request waited. Reuse or upgrade it rather than racing its launch.
 			const current = this.host;
+			if (options.managed && current) throw new Error("Managed host requires a fresh room");
 			if (current && (current.access === "control" || options.access === "view")) return current;
 			if (current) await this.#stopHost(current, "restarting with control access");
-			return this.#launch(options.access, stopEpoch, options.relay);
+			return this.#launch(options.access, stopEpoch, options.relay, options.managed);
 		});
 		// Report manual failures to the caller without poisoning later rotations.
 		this.#ops = started.then(
@@ -211,7 +219,12 @@ export class CollabController {
 	 * can be retained. During a session transition, wait for its final identity
 	 * and state first. Connect only after the previous room is fully gone.
 	 */
-	async #launch(access: CollabAccess, stopEpoch: number, relay?: string): Promise<CollabHost> {
+	async #launch(
+		access: CollabAccess,
+		stopEpoch: number,
+		relay?: string,
+		managed?: ManagedCollabAdmission,
+	): Promise<CollabHost> {
 		if (this.#shutdown) throw new CollabHostStoppedError("collab controller shut down");
 		if (stopEpoch !== this.#stopEpoch) throw new CollabHostStoppedError("collab controller stopped");
 		// Identity cleanup callbacks can precede awaited hooks and message replacement.
@@ -233,6 +246,7 @@ export class CollabController {
 			instanceId: this.instanceId,
 			generation: ++this.#generation,
 			access,
+			managed,
 			guestActionsReady: () => this.#startupComplete && !this.#ctx.session.isSessionTransitioning,
 			onEnded: () => this.#onHostEnded(host),
 		});

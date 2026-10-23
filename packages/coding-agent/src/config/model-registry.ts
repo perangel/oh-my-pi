@@ -322,6 +322,7 @@ export class ModelRegistry {
 	// Keyed by provider name; use the same SQLite cache path as builtins.
 	#runtimeModelManagers: Map<string, { options: ModelManagerOptions<Api>; sourceId: string }> = new Map();
 	#ignoreLocalModelConfig: boolean;
+	readonly #replicaOnly: boolean;
 	#fetch: FetchImpl;
 	#settings: Settings | undefined;
 
@@ -425,6 +426,8 @@ export class ModelRegistry {
 		readonly authStorage: AuthStorage,
 		modelsPath?: string,
 		options?: {
+			/** Empty display-only registry: no catalog, credential, config or provider discovery. */
+			replicaOnly?: boolean;
 			/**
 			 * Gateway mode: ignore local `models.yml` entirely (provider overrides,
 			 * config API keys, custom models, custom discovery). A broker-backed
@@ -439,6 +442,7 @@ export class ModelRegistry {
 			fetch?: FetchImpl;
 		},
 	) {
+		this.#replicaOnly = options?.replicaOnly ?? false;
 		this.#ignoreLocalModelConfig = options?.ignoreLocalModelConfig ?? false;
 		this.#settings = options?.settings;
 		this.#fetch =
@@ -461,6 +465,7 @@ export class ModelRegistry {
 		strategy: ModelRefreshStrategy = "online-if-uncached",
 		options?: ModelRegistryRefreshOptions,
 	): Promise<void> {
+		if (this.#replicaOnly) return;
 		// Credential minting is opt-in. `strategy: "online"` only means "hit the
 		// network for catalogs" — the unscoped model hub opens with that strategy
 		// as a background reconcile, and must not spawn `!command` helpers.
@@ -476,6 +481,7 @@ export class ModelRegistry {
 	 * awaits this local-only, best-effort pass before validating model selectors.
 	 */
 	async hydrateCredentialScopedModelCaches(): Promise<void> {
+		if (this.#replicaOnly) return;
 		if (!this.#credentialScopedCacheHydration) {
 			const providerIds = new Set<string>();
 			for (const providerId of STARTUP_MODEL_CACHE_PROVIDER_IDS) {
@@ -519,6 +525,7 @@ export class ModelRegistry {
 	}
 
 	refreshInBackground(strategy: ModelRefreshStrategy = "online-if-uncached"): void {
+		if (this.#replicaOnly) return;
 		if (this.#backgroundRefresh) {
 			return;
 		}
@@ -622,6 +629,7 @@ export class ModelRegistry {
 		strategy: ModelRefreshStrategy = "online",
 		options?: ModelRegistryRefreshOptions,
 	): Promise<void> {
+		if (this.#replicaOnly) return;
 		// Hover / auto-refresh uses `"online"` for a live catalog. Only F5 (and
 		// other explicit callers) pass refreshCommandCredentials to re-mint
 		// `!command` keys and headers for this provider.
@@ -656,6 +664,7 @@ export class ModelRegistry {
 		providerIds: Iterable<string>,
 		strategy: ModelRefreshStrategy = "online-if-uncached",
 	): Promise<void> {
+		if (this.#replicaOnly) return;
 		const filter = new Set(providerIds);
 		if (filter.size === 0) return;
 		await this.#refreshRuntimeDiscoveries(strategy, filter);
@@ -787,6 +796,7 @@ export class ModelRegistry {
 	 * `online-if-uncached` strategy fetches at most once per cache TTL (24 h).
 	 */
 	async refreshRuntimeProviders(strategy: ModelRefreshStrategy = "online-if-uncached"): Promise<void> {
+		if (this.#replicaOnly) return;
 		if (this.#runtimeModelManagers.size === 0) {
 			return;
 		}
@@ -895,6 +905,7 @@ export class ModelRegistry {
 	}
 
 	#loadModels() {
+		if (this.#replicaOnly) return;
 		this.#resetStaticComposition();
 		// Load custom config first (to know which providers to override).
 		const {

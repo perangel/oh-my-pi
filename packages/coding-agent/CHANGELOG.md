@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added opt-in managed native collaboration SDK hosting and bound guest launch with authenticated scope binding, busy rejection, correlated receipts, targeted cancellation, journal settlement and terminal-safe cleanup.
+
+### Fixed
+
+- Fixed native collaboration guests omitting an assistant completion when joining after its last streaming update.
+- Fixed stale collaboration snapshots and queued frames restoring readiness after disconnect.
+- Preserved bound guest drafts typed while a previous submission persists.
+- Kept managed shutdown settlement ahead of session disposal across repeated signals and interrupted initialization.
+- Rejected malformed collaboration frames without terminating managed hosts, and returned the target owner's receipt for authorized cross-principal cancellation.
+
 ## [18.4.12] - 2026-10-02
 
 ### Added

@@ -44,6 +44,11 @@ coverage/
 .nyc_output/
 packages/ai/test/.temp-images/
 
+# Isolated native collaboration verification/dependency caches
+/.bun-cache/
+/.test-home/
+packages/coding-agent/test/collab/.managed-pty-*/
+
 # Project specific
 !.omp/
 .omp/plugins/

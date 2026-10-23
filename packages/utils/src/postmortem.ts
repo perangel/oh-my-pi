@@ -122,6 +122,19 @@ export function exitProcess(code: number): never {
 let cleanupPromise: Promise<void> | undefined;
 let stdioDisconnectRegistrations = 0;
 
+export type ShutdownSignal = "SIGINT" | "SIGTERM" | "SIGHUP";
+let signalOwner: ((signal: ShutdownSignal) => void) | undefined;
+
+/** Give an embedded process one shutdown owner until its asynchronous settlement finishes. */
+export function claimSignalHandling(handler: (signal: ShutdownSignal) => void): () => void {
+	if (!Bun.isMainThread) throw new Error("Process signal ownership requires the main thread");
+	if (signalOwner) throw new Error("Process signal handling already has an owner");
+	signalOwner = handler;
+	return () => {
+		if (signalOwner === handler) signalOwner = undefined;
+	};
+}
+
 /** User-facing command printed before fatal cleanup so interrupted work can be resumed. */
 export interface FatalRecoveryHint {
 	/** Stable label identifying the recoverable session or process. */
@@ -563,6 +576,7 @@ export async function fatal(error: unknown): Promise<never> {
 if (Bun.isMainThread) {
 	process
 		.on("SIGINT", async () => {
+			if (signalOwner) return signalOwner("SIGINT");
 			await runCleanup(Reason.SIGINT);
 			exitProcess(130); // 128 + SIGINT (2)
 		})
@@ -640,10 +654,12 @@ if (Bun.isMainThread) {
 			void runCleanup(Reason.EXIT); // fire and forget (exit imminent)
 		})
 		.on("SIGTERM", async () => {
+			if (signalOwner) return signalOwner("SIGTERM");
 			await runCleanup(Reason.SIGTERM);
 			exitProcess(143); // 128 + SIGTERM (15)
 		})
 		.on("SIGHUP", async () => {
+			if (signalOwner) return signalOwner("SIGHUP");
 			await runCleanup(Reason.SIGHUP);
 			exitProcess(129); // 128 + SIGHUP (1)
 		});

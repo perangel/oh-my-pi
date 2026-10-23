@@ -2343,7 +2343,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// block, bash command preview, or file diff does not stall the render thread.
 		setImmediate(() => {
 			void warmHighlighter();
-			if (!$env.PI_NO_TITLE && !this.sessionManager.getSessionName()) {
+			if (!this.collabGuest?.bound && !$env.PI_NO_TITLE && !this.sessionManager.getSessionName()) {
 				this.#inputController.prewarmTinyTitleModel();
 			}
 		});
@@ -6757,6 +6757,22 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.#ownsStartedUi = false;
 		}
 		this.isInitialized = false;
+	}
+
+	#closePromise: Promise<void> | undefined;
+
+	/** SDK-owned teardown without process.exit. Always restores the terminal, including storage failure. */
+	close(): Promise<void> {
+		this.#closePromise ??= (async () => {
+			this.#isShuttingDown = true;
+			try {
+				await this.collabGuest?.leave("closed");
+				await this.#teardown();
+			} finally {
+				this.stop();
+			}
+		})();
+		return this.#closePromise;
 	}
 
 	async shutdown(): Promise<void> {

@@ -145,7 +145,232 @@ Advisor records are not guest-visible subagents: they are excluded from roster s
 
 Other session/machine commands remain host-only: `/model`, `/compact`, `/resume`, `/branch`, bash (`!`), python (`$`), skills, etc. Guests keep a small local allowlist (`/dump`, `/export`, `/copy`, `/open`, `/help`, `/hotkeys`, `/theme`, `/settings`, `/leave`, `/collab`, `/exit`, `/quit`).
 
-When a guest joins during an assistant turn, that in-flight turn appears on the first subsequent `message_update`: the guest synthesizes the missing `message_start` from the update's full accumulating message before forwarding the delta. If the host emits no further update for that turn after the guest joins, there is no update from which to synthesize the live component. The durable entry still reaches the replica's message state, but entry frames are intentionally not rendered, so that edge case can remain absent from the live TUI.
+When a guest joins during an assistant turn, the next `message_update` **or `message_end`** establishes the missing native assistant component from its full message. Completion without another delta therefore renders once, even though the snapshot excludes the in-flight message. Entry frames still update the replica without rendering duplicate cards.
+
+## Managed native SDK embedding (opt-in)
+
+`@oh-my-pi/pi-coding-agent/collab` (also the main SDK barrel) exports
+`startManagedCollabHost<Principal>`, `startBoundCollabGuest`,
+`ManagedCollabPolicy<Principal>`, `BoundCollabGuestOptions`, `NativeCollabHandle`,
+and the `ManagedCollab*` wire contracts. This is a real `AgentSession` /
+`InteractiveMode` / native collaboration transport, not a headless renderer or
+an external-conversation backend. The ordinary CLI, browser and unbound SDK
+defaults above are unchanged. The managed extension is not implemented by the
+ordinary browser client.
+
+### Host ownership and admission
+
+Create a **persistent**, dedicated SDK session with `createAgentSession`, then:
+
+```ts
+import { startManagedCollabHost, type ManagedCollabPolicy } from "@oh-my-pi/pi-coding-agent/collab";
+
+const native = await startManagedCollabHost({
+  session: sdkResult, // CreateAgentSessionResult, owned exclusively by this host
+  relay: "ws://127.0.0.1:7466",
+  binding: { binding: bindingVersion, hostEpoch, childId },
+  policy, // ManagedCollabPolicy<YourAuthenticatedPrincipal>
+});
+// Ready: real UI initialized, native room connected, publication attempted.
+// Private IPC only: { link: native.host.link, expected: native.host.managedIdentity }
+// Add a scoped opaque credential issued/verified by your own authority.
+```
+
+The supervisor owns a private PTY for the host, drains it, and never feeds it
+human commands. Host model/auth/context/tools are explicit SDK inputs; this
+factory does not grant or restrict model tools on the embedder's behalf.
+Use an isolated HOME/config/cwd and explicit settings; disable extension
+discovery, MCP, advisor/autolearn/memory/composer prediction and cache warming
+when not required. `Settings.initIsolated` supplies fresh in-memory settings
+without reading global, project or overlay configuration. Do not mix a managed
+host with other callers of `session.prompt`, queues, session switching, or
+background turn producers. Its journal path/session ID are fenced and checked;
+an unexpected journal relocation withdraws admission and requires reconciliation.
+
+Policy contract:
+
+| Hook | Ownership |
+|---|---|
+| `authenticate(capability, identity)` | Resolve an opaque credential to your principal/scope. Runs before a peer receives history or live frames. A display name is never authority. |
+| `principalId(principal)` | Stable key across reconnect for the in-process dedupe guard; include your tenant/scope as needed. |
+| `lookup(principal, requestId, request?)` | Runs on **every** submission, including retries, and on explicit lookup. Return the durable receipt if known. Compare payload/binding when `request` is supplied; never authorize an uncertain retry by returning “not found.” |
+| `admit(principal, request)` | Called only when idle, before native append/queue/model dispatch. Persist dispatch intent and return a host-lifetime-unique `turnId`, or `{reject: code}`. May append your explicit context while holding admission. **Do not call prompt here.** |
+| `cancel(principal, target)` | Authorize precisely `{requestId, turnId}`; reject other principals' cancellation unless your policy permits it. After awaiting authorization OMP rechecks the same active turn before aborting. |
+| `settled(principal, receipt)` | Called after the real prompt returns and completed entries plus a native settlement marker have been flushed. Commit your receipt/projection here. Await any embedder-owned effect callbacks here or inside your tools. |
+| `failed?(principal, receipt)` | Correlated `unknown` result after an admission/settlement failure. Admission is already withdrawn; report/reconcile, never replay inference. `stop`/`settle` also reject after this failure. |
+
+**OMP alone invokes `promptCustomMessage` once after `admit` succeeds**, without
+`streamingBehavior`. Busy requests return `rejected/busy`, with no append,
+steering or queueing. The host keeps up to 10,000 seen request keys;
+at capacity it refuses new work rather than evicting deduplication evidence.
+Same-ID attempts still call your lookup and never redispatch a seen request.
+Changed text under a seen ID returns `request-conflict`. Durable dedupe across
+host replacement remains your lookup's responsibility; OMP does not replay
+unfinished work on open.
+
+Managed hosts deny raw `prompt`, untargeted `abort`, `agent-cmd`,
+`fetch-transcript` and `ui-response`, even from writable peers. Agent rosters,
+subagent bus traffic and UI question forwarding are suppressed. There is no
+domain policy, auth database, station logic or approval authority inside OMP.
+
+### Binding, receipts and native history
+
+The unchanged native protocol negotiates `managed.version ===
+MANAGED_COLLAB_VERSION` (currently 1) in hello/welcome. Version 1 requires the
+whole admission/lookup/targeted-cancel contract; there is no downgrade. Old
+hosts, wrong credentials and mismatched identities fail clearly.
+`ManagedCollabIdentity` contains opaque `binding`, `hostEpoch`, `childId`,
+plus native `sessionId`, `instanceId`, `generation`. Compare **all six**:
+generation starts again at 1 in a new controller instance.
+
+Requests carry `{requestId, expected, text}`. Request and turn IDs are opaque
+non-empty strings of at most 256 characters; malformed wire fields are refused
+before typed policy callbacks. Receipts carry the request ID,
+optional turn ID, phase (`running`, `completed`, `cancelled`, `failed`,
+`rejected`, `unknown`), optional code and canonical `entryIds` /
+`settlementEntryId`. `running` means dispatch intent accepted, not proof that
+the model ran. A provider failure is `failed`; an unprovable policy/storage
+outcome is `unknown` and closes admission.
+
+The attributed native `collab-prompt` entry has
+`details: {managed: {requestId, turnId}, expected}`. Live event frames carry
+the same `managed` turn; native state includes `activeTurn`. The final receipt
+references the native entries produced by that prompt and an
+`appendCustomEntry("managed-collab-settlement", receipt)` marker. The marker's
+own entry ID is the receipt's `settlementEntryId`; it need not be duplicated
+inside the marker data. These are references, not a second transcript.
+`ensureOnDisk`/`flush` promise completed journal writes, **not fsync or
+token-durable storage**. A callback failure after journal flush can be
+reconciled from that marker; it is never automatic permission to rerun.
+
+### Bound guest launch and terminal lifecycle
+
+In a **fresh, disposable guest process**, pass the capability in memory, or
+decode it from an inherited private pipe before calling this API:
+
+```ts
+import { startBoundCollabGuest } from "@oh-my-pi/pi-coding-agent/collab";
+
+const native = await startBoundCollabGuest({
+  cwd: privateCwd, agentDir: privateAgentDir,
+  link: startup.link, capability: startup.credential, expected: startup.identity,
+  label: "Factory name | Task ID | Station | CONTROL", // non-secret fixed chrome
+  beforeSend: request => outbox.persist(request),
+  onReceipt: receipt => coordinator.observe(receipt),
+  onEvent: (event, turn) => observeNativeEvent(event, turn), // optional, not durable replay
+  onClosed: () => notifyLauncher(),
+  reconnectTimeoutMs: 30_000,
+});
+await native.closed;
+```
+
+Never use argv, environment variables, terminal `/join` input, logs, QR codes
+or shell history for the capability. The launcher owns its private profile and
+must set HOME/XDG/TMPDIR/OMP config roots before module import; `agentDir`
+alone is not a process sandbox. Do not expose owner/provider credentials to
+this process. Use one embedding per process; isolated initialization refuses
+an already-initialized global Settings instance.
+
+The constructor disables ambient provider/config/plugin/MCP/LSP/IRC
+discovery, tools, local inference and prediction/autolearn/advisor/memory
+background jobs. A local SDK replica still exists, with an irreversible
+execution latch. Scope and identity are copied/frozen. Local slash/shell/queue
+commands and scope-switching shortcuts are unavailable; `/leave`, `/exit`,
+`/quit` and exit keys only detach. Native transcript, composer, scrolling and
+tool/thinking expansion remain native. Esc targets the displayed active turn,
+subject to host policy, not “whatever is running when the abort arrives.”
+
+`beforeSend` is awaited with an immutable envelope before transport dispatch.
+A disconnect during that await leaves the request unsent/uncertain and does
+not queue it for reconnect. `guest.submitRequest(request)`,
+`guest.lookupRequest(requestId)` and `guest.cancelRequest(target)` are the
+supported explicit control methods; obtain their concrete types from the
+returned handle. A caller must lookup uncertain work before deciding what to
+do. Never regenerate a request ID merely because its response was lost.
+Rejected native input restores the last draft when the editor is empty. Completing
+an earlier `beforeSend` never clears a newer draft typed while persistence waited.
+
+Reconnect uses native full welcome/snapshot replacement and canonical entry
+IDs. No queued prompt is replayed. The total reconnect budget is bounded;
+failed startup, leave, host stop, fatal transport loss and budget exhaustion
+close the guest without restoring a usable local agent. Startup failure
+rejects; `onClosed` runs once for terminal guest closure. Callback exceptions
+do not unlock a local executor or log callback error text.
+
+`guest.connected` becomes true only after the current connection's snapshot
+is activated. Queued frames and asynchronous snapshot completion are fenced to
+that connection; stale completion cannot publish readiness or clear its successor's
+reconnect deadline. `onSnapshot(identity)` optionally notifies the launcher after
+each successful join/resync. Inspect the actual native snapshot via
+`mode.sessionManager.getEntries()`, not a shadow history. The initial callback
+can run before the start promise resolves; subsequent callbacks are useful
+for scheduling explicit receipt lookups.
+
+Both start functions resolve at readiness and expose `mode`, `stopping`,
+idempotent `stop(timeoutMs = 10_000)` and `closed`. Stop restores the terminal
+even on cleanup error; timeout rejects and means **process stop unconfirmed**,
+not permission to start another writer. SIGINT/SIGTERM/SIGHUP invoke cleanup and
+set exit codes 130/143/129; the launcher awaits closure and confirms child/process-group
+exit. Native initialization must settle before final teardown, so an interrupted
+startup cannot reopen the terminal after cleanup. One native handle owns process
+signal handling through settlement and teardown, including repeated signals and
+stop timeouts; do not run multiple native handles in one process. The API never
+calls `process.exit`. Guest stop detaches only. Host stop
+withdraws the room, aborts its active turn and awaits settlement before session
+disposal. To drain without cancelling, call `await native.host.settle()` first:
+it withdraws new admission and awaits the current turn, journal flush and
+policy settlement, then call `stop`. Do not await stop recursively inside a
+policy callback. Keep callbacks bounded and supervise the process.
+
+After **confirmed old-writer exit**, reopen the exact file with
+`SessionManager.open(file, undefined, undefined, {throwIfMissing: true})`,
+verify its ID/path, reconcile receipts, and start a new host with a new
+host epoch/child identity. Do not use “most recent,” resume a guest replica,
+attach a worker session, or automatically replay a dispatched-but-uncertain
+request.
+
+### Verification and pinned-source consumption
+
+This source adds APIs on the 18.4.12 baseline; the unchanged version string
+does **not** mean the published 18.4.12 package contains them. Until separately
+reviewed/released upstream, consume the exact evaluation source commit, not a
+mutable branch, an assumed npm version or a claim of upstream acceptance. A reproducible local SDK layout is:
+
+1. Check out that full commit into a dedicated build directory (`OMP`).
+2. With a disposable HOME/cache, run `bun install --frozen-lockfile --ignore-scripts`,
+   `bun run gen:tool-views`, then `bun run gen:bundle` there. Use Bun >=1.4.
+3. Build the platform native addon with `bun --cwd=packages/natives run build`,
+   or supply the exact baseline platform addon from the public 18.4.12
+   `@oh-my-pi/pi-natives-<platform>` tarball after verifying registry integrity,
+   at `packages/natives/native/pi_natives.<platform>.node`.
+4. Keep the whole pinned workspace and its dependency tree together. In the
+   isolated launcher package, create
+   `node_modules/@oh-my-pi/pi-coding-agent` as a filesystem symlink to
+   `$OMP/packages/coding-agent`. This uses **no global `bun link` registration**.
+   Bun resolves the exported SDK source and its workspace dependencies from
+   that pinned tree. Import only the main package or `/collab`; never `src/*`.
+   Do not distribute only a coding-agent tarball with registry dependencies:
+   the changed `pi-wire` contract must come from the same commit.
+5. Run the launcher using Bun. Record the full source commit, Bun version,
+   lockfile and addon integrity alongside the artifact. The SDK is exported
+   TypeScript; `dist/cli.js` is the CLI build, not a replacement SDK entrypoint.
+
+The native regression command is
+`python3 packages/coding-agent/test/collab/managed-pty.py --bun /absolute/path/to/bun`.
+It requires Python 3, `pyte`, POSIX PTYs, `git`, `ps`, and `lsof` (the harness
+uses macOS tool paths). It runs a synthetic in-process provider, two real
+native guests and a loopback-only test relay, sends actual PTY input, checks
+canonical entries and decoded screens, and audits termios, process groups,
+listeners, daemon roots, capabilities in logs and disposable-profile removal.
+The completion-only case drops the final update at the real transport send
+boundary; the pre-fix native guest failed to render that final answer. The
+relay is a test fixture, not a production self-hosted relay distribution.
+The harness also checks next-draft preservation, settlement before signal teardown,
+repeated signals, and interrupted startup. The collaboration suite exercises
+malformed encrypted input, cross-principal cancellation receipt identity and
+old-generation snapshot completion/queued frames during reconnect.
+Also run the package `bun run check` gates and
+`bun test packages/coding-agent/test/collab` for unbound regressions.
 
 ## Web client
 

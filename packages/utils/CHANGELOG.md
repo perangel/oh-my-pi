@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added exclusive process signal ownership for embedded runtimes that must settle asynchronous work before native teardown.
+
 ## [18.4.12] - 2026-10-02
 
 ### Fixed

@@ -12,6 +12,9 @@ import type {
 	BusChannel,
 	CollabUiRequest,
 	GuestFrame,
+	ManagedCollabHostFrame,
+	ManagedCollabIdentity,
+	ManagedCollabTurn,
 	ParsedCollabLink,
 	Participant,
 	AgentSnapshot as WireAgentSnapshot,
@@ -52,6 +55,7 @@ export type { CollabSessionState };
  * that serialize into those shapes.
  */
 export type CollabFrame =
+	| ManagedCollabHostFrame
 	// guest -> host (hello/abort/agent-cmd/fetch-transcript/ui-response are taken verbatim from the wire grammar)
 	| Exclude<GuestFrame, { t: "prompt" }>
 	| { t: "prompt"; text: string; images?: ImageContent[] }
@@ -71,6 +75,7 @@ export type CollabFrame =
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
+			managed?: { version: number; identity: ManagedCollabIdentity };
 	  }
 	/**
 	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
@@ -82,7 +87,7 @@ export type CollabFrame =
 	 */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
 	| { t: "entry"; entry: SessionEntry }
-	| { t: "event"; event: AgentSessionEvent }
+	| { t: "event"; event: AgentSessionEvent; managed?: ManagedCollabTurn }
 	| { t: "state"; state: CollabSessionState }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
 	| { t: "bus"; channel: BusChannel; data: unknown }

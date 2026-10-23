@@ -723,6 +723,20 @@ export class Settings {
 		);
 	}
 
+	/** Initialize a fresh embedding process without reading any global/project/overlay configuration. */
+	static initIsolated(options: Pick<SettingsOptions, "cwd" | "agentDir" | "overrides"> = {}): Settings {
+		if (globalInstancePromise) throw new Error("Isolated settings require a fresh process");
+		const instance = new Settings({ ...options, inMemory: true });
+		instance.#configFiles = [];
+		instance.#rebuildMerged();
+		instance.#validateAll();
+		globalInstance = instance;
+		globalInstancePromise = Promise.resolve(instance);
+		clearBoundSettingsMethods();
+		bindEffects(instance);
+		return instance;
+	}
+
 	/**
 	 * Load effective settings from config.yml and project providers without
 	 * opening agent.db, migrating legacy settings, or writing marker files.

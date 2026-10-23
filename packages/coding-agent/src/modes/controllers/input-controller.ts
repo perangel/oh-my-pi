@@ -317,6 +317,31 @@ export class InputController {
 	}
 
 	setupKeyHandlers(): void {
+		if (this.ctx.collabGuest?.bound) {
+			const guest = this.ctx.collabGuest;
+			this.ctx.editor.setActionKeys("app.interrupt", this.ctx.keybindings.getKeys("app.interrupt"));
+			this.ctx.editor.onEscape = () => guest.sendAbort();
+			this.ctx.editor.setActionKeys("app.clear", this.ctx.keybindings.getKeys("app.clear"));
+			this.ctx.editor.onClear = () => {
+				process.exitCode = 130;
+				void guest.leave("interrupt");
+			};
+			this.ctx.editor.setActionKeys("app.exit", this.ctx.keybindings.getKeys("app.exit"));
+			this.ctx.editor.onExit = () => {
+				void guest.leave("exit");
+			};
+			this.ctx.editor.clearCustomKeyHandlers();
+			for (const key of this.ctx.keybindings.getKeys("app.tools.expand")) {
+				this.ctx.editor.setCustomKeyHandler(key, () => this.toggleToolOutputExpansion());
+			}
+			for (const key of this.ctx.keybindings.getKeys("app.thinking.toggle")) {
+				this.ctx.editor.setCustomKeyHandler(key, () => this.ctx.toggleThinkingBlockVisibility());
+			}
+			this.ctx.editor.onChange = text => {
+				this.#draftText = text;
+			};
+			return;
+		}
 		this.#draftText ??= this.ctx.editor.getText();
 		this.ctx.editor.setActionKeys("app.interrupt", this.ctx.keybindings.getKeys("app.interrupt"));
 		if (!this.#focusedLeftTapListenerInstalled) {
@@ -937,6 +962,14 @@ export class InputController {
 
 	setupEditorSubmitHandler(): void {
 		this.ctx.editor.onSubmit = async (text: string) => {
+			if (this.ctx.collabGuest?.bound) {
+				try {
+					await this.ctx.collabGuest.submitBoundInput(text);
+				} catch {
+					this.ctx.showError("Bound request not sent; inspect its receipt before retrying");
+				}
+				return;
+			}
 			const submittedText = text;
 			const armed = this.#armedBareCommand;
 			this.#armedBareCommand = undefined;
@@ -1849,6 +1882,10 @@ export class InputController {
 
 	/** Send editor text as a follow-up message (queued behind current stream). */
 	async handleFollowUp(): Promise<void> {
+		if (this.ctx.collabGuest?.bound) {
+			await this.ctx.collabGuest.submitBoundInput(this.ctx.editor.getText());
+			return;
+		}
 		let text = this.#compactDraftImages(this.ctx.editor.getExpandedText().trim());
 		let images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
 		let imageLinks =
