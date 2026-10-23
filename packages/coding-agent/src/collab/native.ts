@@ -10,7 +10,12 @@ import { SessionManager } from "../session/session-manager";
 import type { BoundCollabGuestOptions } from "./bound-types";
 import { CollabGuestLink } from "./guest";
 import type { CollabHost } from "./host";
-import { ManagedCollabCoordinator, type ManagedCollabAdmission, type ManagedCollabPolicy } from "./managed";
+import {
+	ManagedCollabCoordinator,
+	type ManagedCollabAdmission,
+	type ManagedCollabIdentity,
+	type ManagedCollabPolicy,
+} from "./managed";
 
 export interface NativeCollabHandle {
 	/** Real native UI, not a second renderer. The embedding owns its terminal/process. */
@@ -19,6 +24,16 @@ export interface NativeCollabHandle {
 	/** Idempotent bounded cleanup. Timeout rejects: the supervisor must confirm process exit before replacement. */
 	stop(timeoutMs?: number): Promise<void>;
 	closed: Promise<void>;
+}
+
+export interface NativeManagedCollabHandle<Principal> extends NativeCollabHandle {
+	/** Trusted local admission and every room share this coordinator and its pending work. */
+	readonly coordinator: ManagedCollabCoordinator<Principal>;
+	/** Generation is zero before the first room; publish a guest capability only after startRoom resolves. */
+	readonly identity: ManagedCollabIdentity;
+	readonly host: CollabHost | undefined;
+	/** Coalesces concurrent starts. Relay failure leaves local admission and the native lifecycle alive. */
+	startRoom(relay: string): Promise<CollabHost>;
 }
 
 function lifecycle(
@@ -93,16 +108,17 @@ function lifecycle(
 	};
 }
 
-/** Resolves ready only after native initialization, room connection and publication. */
+/** Initializes the native session without a relay. Room startup is an explicit, lazy operation. */
 export async function startManagedCollabHost<Principal>(options: {
 	session: CreateAgentSessionResult;
-	relay: string;
 	binding: ManagedCollabAdmission["binding"];
 	policy: ManagedCollabPolicy<Principal>;
-}): Promise<NativeCollabHandle & { host: CollabHost }> {
+}): Promise<NativeManagedCollabHandle<Principal>> {
 	const result = options.session;
+	const sessionId = result.session.sessionManager.getSessionId();
 	const mode = new InteractiveMode(result.session, VERSION, undefined, result.setToolUIContext);
 	const coordinator = new ManagedCollabCoordinator(result.session, options.binding, options.policy);
+	mode.collabController.bindManaged(coordinator);
 	const initializing = mode.init({ autoStartCollab: false, recentSessions: Promise.resolve([]) });
 	const handle = lifecycle(mode, initializing, async () => {
 		coordinator.withdraw();
@@ -110,15 +126,40 @@ export async function startManagedCollabHost<Principal>(options: {
 		await result.session.abort();
 		await coordinator.stop();
 	});
+	let opening: Promise<CollabHost> | undefined;
+	const startRoom = (relay: string): Promise<CollabHost> => {
+		if (handle.stopping) return Promise.reject(new Error("Native collaboration startup stopped"));
+		if (opening) return opening;
+		const existing = mode.collabController.host;
+		if (existing) return Promise.resolve(existing);
+		opening = mode.collabController
+			.start({ access: "control", relay, managed: coordinator })
+			.then(host => {
+				if (handle.stopping) throw new Error("Native collaboration startup stopped");
+				return host;
+			})
+			.finally(() => {
+				opening = undefined;
+			});
+		return opening;
+	};
 	try {
 		await initializing;
 		if (handle.stopping) throw new Error("Native collaboration startup stopped");
 		await mode.renderInitialMessages();
 		if (handle.stopping) throw new Error("Native collaboration startup stopped");
 		mode.collabController.startupComplete();
-		const host = await mode.collabController.start({ access: "control", relay: options.relay, managed: coordinator });
-		if (handle.stopping) throw new Error("Native collaboration startup stopped");
-		return Object.assign(handle, { host });
+		return Object.defineProperties(Object.assign(handle, { coordinator, startRoom }), {
+			host: { get: () => mode.collabController.host },
+			identity: {
+				get: (): ManagedCollabIdentity => ({
+					...coordinator.binding,
+					sessionId,
+					instanceId: mode.collabController.instanceId,
+					generation: mode.collabController.generation,
+				}),
+			},
+		}) as NativeManagedCollabHandle<Principal>;
 	} catch (error) {
 		await handle.stop();
 		throw error;

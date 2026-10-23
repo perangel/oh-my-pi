@@ -152,7 +152,8 @@ When a guest joins during an assistant turn, the next `message_update` **or `mes
 `@oh-my-pi/pi-coding-agent/collab` (also the main SDK barrel) exports
 `startManagedCollabHost<Principal>`, `startBoundCollabGuest`,
 `ManagedCollabPolicy<Principal>`, `BoundCollabGuestOptions`, `NativeCollabHandle`,
-and the `ManagedCollab*` wire contracts. This is a real `AgentSession` /
+`NativeManagedCollabHandle<Principal>`, and the `ManagedCollab*` wire contracts.
+This is a real `AgentSession` /
 `InteractiveMode` / native collaboration transport, not a headless renderer or
 an external-conversation backend. The ordinary CLI, browser and unbound SDK
 defaults above are unchanged. The managed extension is not implemented by the
@@ -167,12 +168,18 @@ import { startManagedCollabHost, type ManagedCollabPolicy } from "@oh-my-pi/pi-c
 
 const native = await startManagedCollabHost({
   session: sdkResult, // CreateAgentSessionResult, owned exclusively by this host
-  relay: "ws://127.0.0.1:7466",
   binding: { binding: bindingVersion, hostEpoch, childId },
   policy, // ManagedCollabPolicy<YourAuthenticatedPrincipal>
 });
-// Ready: real UI initialized, native room connected, publication attempted.
-// Private IPC only: { link: native.host.link, expected: native.host.managedIdentity }
+// Ready: real UI initialized; no relay connection is needed for local admission.
+await native.coordinator.submitLocal(
+  authenticatedPrincipal,
+  { requestId, expected: native.identity, text },
+  onReceipt,
+);
+// Open a room only when an attachment is requested.
+const room = await native.startRoom("ws://127.0.0.1:7466");
+// Private IPC only: { link: room.link, expected: room.managedIdentity }
 // Add a scoped opaque credential issued/verified by your own authority.
 ```
 
@@ -186,6 +193,28 @@ without reading global, project or overlay configuration. Do not mix a managed
 host with other callers of `session.prompt`, queues, session switching, or
 background turn producers. Its journal path/session ID are fenced and checked;
 an unexpected journal relocation withdraws admission and requires reconciliation.
+
+The embedder authenticates principals passed to `coordinator.submitLocal`,
+`lookupLocal` and `cancelLocal`. Those methods use the **same** policy, active-turn
+reservation, deduplication, cancellation and settlement as authenticated guests;
+they are not alternate prompt paths. Do not manufacture transport peer identities
+for local callers. The lower-level transport seam uses unique symbol tokens,
+not reusable relay peer numbers.
+
+`startRoom(relay)` coalesces concurrent starts and reuses a live room. A failed
+connection leaves local admission alive. `native.host` is optional and dynamic;
+`native.identity` pins the native session ID and exposes the controller's current
+instance/generation. Generation is **0 before any room attempt**, and advances
+when a room is allocated, even if connection later fails. Reconcile your durable
+identity projection after failed starts too. Publish guest capabilities only after
+`startRoom` resolves. Managed-only controller ownership is established before UI
+initialization; `/collab` cannot silently create an unbound room.
+
+Stopping a room detaches transport; it does not stop local admission or cancel
+already-received authenticated requests. Their policy admission/settlement still
+finishes. Only the native handle's `stop` withdraws the shared coordinator and
+owns session shutdown. A later room can reuse that coordinator and exact journal
+with a fresh generation.
 
 Policy contract:
 
@@ -221,7 +250,8 @@ whole admission/lookup/targeted-cancel contract; there is no downgrade. Old
 hosts, wrong credentials and mismatched identities fail clearly.
 `ManagedCollabIdentity` contains opaque `binding`, `hostEpoch`, `childId`,
 plus native `sessionId`, `instanceId`, `generation`. Compare **all six**:
-generation starts again at 1 in a new controller instance.
+room generations start at 1 in a new controller instance; generation 0 denotes
+local readiness before any room has been allocated, never a published guest room.
 
 Requests carry `{requestId, expected, text}`. Request and turn IDs are opaque
 non-empty strings of at most 256 characters; malformed wire fields are refused
@@ -315,11 +345,12 @@ exit. Native initialization must settle before final teardown, so an interrupted
 startup cannot reopen the terminal after cleanup. One native handle owns process
 signal handling through settlement and teardown, including repeated signals and
 stop timeouts; do not run multiple native handles in one process. The API never
-calls `process.exit`. Guest stop detaches only. Host stop
-withdraws the room, aborts its active turn and awaits settlement before session
-disposal. To drain without cancelling, call `await native.host.settle()` first:
-it withdraws new admission and awaits the current turn, journal flush and
-policy settlement, then call `stop`. Do not await stop recursively inside a
+calls `process.exit`. Guest stop detaches only. The native managed handle's stop
+withdraws admission and the room, aborts its active turn and awaits settlement
+before session disposal. To drain without cancelling, call
+`await native.coordinator.stop()` first: it withdraws new admission and awaits
+the current turn, journal flush and policy settlement, then call native `stop`.
+Do not await stop recursively inside a
 policy callback. Keep callbacks bounded and supervise the process.
 
 After **confirmed old-writer exit**, reopen the exact file with
@@ -365,10 +396,12 @@ listeners, daemon roots, capabilities in logs and disposable-profile removal.
 The completion-only case drops the final update at the real transport send
 boundary; the pre-fix native guest failed to render that final answer. The
 relay is a test fixture, not a production self-hosted relay distribution.
-The harness also checks next-draft preservation, settlement before signal teardown,
-repeated signals, and interrupted startup. The collaboration suite exercises
-malformed encrypted input, cross-principal cancellation receipt identity and
-old-generation snapshot completion/queued frames during reconnect.
+The harness also checks relay-independent local readiness, failed relay startup,
+cross-ingress deduplication/busy rejection, room-only detach and same-journal
+reentry, next-draft preservation, settlement before signal teardown, repeated
+signals, and interrupted startup. The collaboration suite exercises malformed
+encrypted input, cross-principal cancellation receipt identity and old-generation
+snapshot completion/queued frames during reconnect.
 Also run the package `bun run check` gates and
 `bun test packages/coding-agent/test/collab` for unbound regressions.
 

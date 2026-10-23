@@ -14,6 +14,7 @@ import {
 	type ManagedCollabIdentity,
 	type ManagedCollabReceipt,
 	type NativeCollabHandle,
+	type NativeManagedCollabHandle,
 } from "@oh-my-pi/pi-coding-agent";
 import { CollabSocket } from "../../../src/collab/relay-client";
 import { importRoomKey } from "../../../src/collab/crypto";
@@ -32,6 +33,8 @@ globalThis.fetch = Object.assign(
 );
 let handle: NativeCollabHandle | undefined;
 let settleHost: (() => Promise<void>) | undefined;
+let managedNative: NativeManagedCollabHandle<string> | undefined;
+let openRoom: ((relay: string, coalesce?: boolean) => Promise<void>) | undefined;
 let timer: Timer | undefined;
 const timeout = setTimeout(() => {
 	process.exitCode = 2;
@@ -225,7 +228,6 @@ try {
 				? await startUnboundHost(result)
 				: await startManagedCollabHost<string>({
 						session: result,
-						relay: process.env.RELAY_URL!,
 						binding: { binding: "scope-v1", hostEpoch: `epoch-${process.pid}`, childId: dir },
 						policy: {
 							principalId(principal) {
@@ -271,24 +273,40 @@ try {
 						},
 					});
 		handle = native;
-		settleHost = () => native.host.settle();
-		fs.writeFileSync(
-			path.join(dir, "capability.json"),
-			JSON.stringify({
-				link: native.host.link,
-				capability: "private-fixture-token",
-				expected: native.host.managedIdentity ?? {
-					binding: "unbound",
-					hostEpoch: "unbound",
-					childId: dir,
-					sessionId: manager.getSessionId(),
-					instanceId: native.host.instanceId,
-					generation: native.host.generation,
-				},
-			}),
-			{ mode: 0o600 },
-		);
-		record({ type: "ready", sessionId: manager.getSessionId(), journal: manager.getSessionFile() });
+		if ("coordinator" in native) managedNative = native;
+		settleHost = () => (managedNative ? managedNative.coordinator.stop() : native.host!.settle());
+		openRoom = async (relay, coalesce = false) => {
+			let room: CollabHost;
+			if ("startRoom" in native) {
+				const opening = native.startRoom(relay);
+				if (coalesce) record({ type: "room-start-coalesced", same: opening === native.startRoom(relay) });
+				room = await opening;
+			} else room = native.host;
+			fs.writeFileSync(
+				path.join(dir, "capability.json"),
+				JSON.stringify({
+					link: room.link,
+					capability: "private-fixture-token",
+					expected: room.managedIdentity ?? {
+						binding: "unbound",
+						hostEpoch: "unbound",
+						childId: dir,
+						sessionId: manager.getSessionId(),
+						instanceId: room.instanceId,
+						generation: room.generation,
+					},
+				}),
+				{ mode: 0o600 },
+			);
+			record({ type: "room-ready", identity: room.managedIdentity });
+		};
+		if (role !== "lazy-host") await openRoom(process.env.RELAY_URL!);
+		record({
+			type: "ready",
+			sessionId: manager.getSessionId(),
+			journal: manager.getSessionFile(),
+			identity: managedNative?.identity,
+		});
 	} else if (role === "raw") {
 		const parsed = parseCollabLink(input!.link);
 		if ("error" in parsed) throw new Error("bad fixture capability");
@@ -362,7 +380,22 @@ try {
 				record({ type: "stop-idempotent", same: stopping === handle.stop() });
 				await stopping.catch(() => {});
 			} else if (raw) raw.send(command as CollabFrame);
-			else if (command.lookup && handle?.mode.collabGuest) handle.mode.collabGuest.lookupRequest(command.lookup);
+			else if (command.room && openRoom) {
+				try {
+					await openRoom(command.room, command.coalesce);
+				} catch {
+					record({ type: "room-failed" });
+				}
+			} else if (command.roomStop && managedNative) {
+				await managedNative.mode.collabController.stop("fixture room detach");
+				record({ type: "room-stopped" });
+			} else if (command.local && managedNative) {
+				await managedNative.coordinator.submitLocal(
+					"owner",
+					{ ...command.local, expected: managedNative.identity },
+					receipt => record({ type: "local-receipt", receipt }),
+				);
+			} else if (command.lookup && handle?.mode.collabGuest) handle.mode.collabGuest.lookupRequest(command.lookup);
 			else if (command.resubmit && handle?.mode.collabGuest)
 				await handle.mode.collabGuest.submitRequest(command.resubmit);
 			else if (command.settle) {

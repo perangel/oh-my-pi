@@ -30,15 +30,15 @@ export interface ManagedCollabPolicy<Principal> {
 	failed?(principal: Principal, receipt: ManagedCollabReceipt): Promise<void>;
 }
 
-/** Type-erased transport seam; principal values stay inside the typed policy closure. */
+/** Type-erased transport seam. Unique peer tokens fence reused wire IDs across rooms. */
 export interface ManagedCollabAdmission {
 	readonly binding: Readonly<Pick<ManagedCollabIdentity, "binding" | "hostEpoch" | "childId">>;
 	readonly activeTurn: ManagedCollabTurn | undefined;
-	authenticate(peer: number, capability: string, identity: ManagedCollabIdentity): Promise<void>;
-	forget(peer: number): void;
-	lookup(peer: number, requestId: string): Promise<ManagedCollabReceipt>;
-	submit(peer: number, request: ManagedCollabRequest, notify: (receipt: ManagedCollabReceipt) => void): Promise<void>;
-	cancel(peer: number, target: ManagedCollabTurn): Promise<ManagedCollabReceipt>;
+	authenticate(peer: symbol, capability: string, identity: ManagedCollabIdentity): Promise<void>;
+	forget(peer: symbol): void;
+	lookup(peer: symbol, requestId: string): Promise<ManagedCollabReceipt>;
+	submit(peer: symbol, request: ManagedCollabRequest, notify: (receipt: ManagedCollabReceipt) => void): Promise<void>;
+	cancel(peer: symbol, target: ManagedCollabTurn): Promise<ManagedCollabReceipt>;
 	withdraw(): void;
 	/** Withdraw new work, then await the current prompt, flush and settlement callback. Does not abort it. */
 	stop(): Promise<void>;
@@ -62,8 +62,8 @@ export class ManagedCollabCoordinator<Principal> implements ManagedCollabAdmissi
 	readonly binding: Readonly<Pick<ManagedCollabIdentity, "binding" | "hostEpoch" | "childId">>;
 	#session: AgentSession;
 	#policy: ManagedCollabPolicy<Principal>;
-	#principals = new Map<number, Principal>();
-	#authentication = new Map<number, symbol>();
+	#principals = new Map<symbol, Principal>();
+	#authentication = new Map<symbol, symbol>();
 	#payloads = new Map<string, string>();
 	#seen = new Map<string, ManagedCollabReceipt>();
 	#active: ManagedCollabTurn | undefined;
@@ -92,7 +92,7 @@ export class ManagedCollabCoordinator<Principal> implements ManagedCollabAdmissi
 		return this.#active && { ...this.#active };
 	}
 
-	async authenticate(peer: number, capability: string, identity: ManagedCollabIdentity): Promise<void> {
+	async authenticate(peer: symbol, capability: string, identity: ManagedCollabIdentity): Promise<void> {
 		if (this.#closed) throw new Error("managed host stopped");
 		const attempt = Symbol();
 		this.#authentication.set(peer, attempt);
@@ -102,12 +102,12 @@ export class ManagedCollabCoordinator<Principal> implements ManagedCollabAdmissi
 		this.#principals.set(peer, principal);
 	}
 
-	forget(peer: number): void {
+	forget(peer: symbol): void {
 		this.#authentication.delete(peer);
 		this.#principals.delete(peer);
 	}
 
-	#principal(peer: number): Principal {
+	#principal(peer: symbol): Principal {
 		if (!this.#principals.has(peer)) throw new Error("managed authentication required");
 		return this.#principals.get(peer)!;
 	}
@@ -116,14 +116,27 @@ export class ManagedCollabCoordinator<Principal> implements ManagedCollabAdmissi
 		return JSON.stringify([this.#policy.principalId(principal), requestId]);
 	}
 
-	async lookup(peer: number, requestId: string): Promise<ManagedCollabReceipt> {
-		const principal = this.#principal(peer);
+	lookup(peer: symbol, requestId: string): Promise<ManagedCollabReceipt> {
+		return this.lookupLocal(this.#principal(peer), requestId);
+	}
+
+	/** The embedder authenticates the principal; durable authorization remains in the policy. */
+	async lookupLocal(principal: Principal, requestId: string): Promise<ManagedCollabReceipt> {
 		const receipt = await this.#policy.lookup(principal, requestId);
 		return receipt ?? this.#seen.get(this.#key(principal, requestId)) ?? { requestId, phase: "unknown" };
 	}
 
-	submit(peer: number, request: ManagedCollabRequest, notify: (receipt: ManagedCollabReceipt) => void): Promise<void> {
-		const work = this.#submit(this.#principal(peer), request, notify);
+	submit(peer: symbol, request: ManagedCollabRequest, notify: (receipt: ManagedCollabReceipt) => void): Promise<void> {
+		return this.submitLocal(this.#principal(peer), request, notify);
+	}
+
+	/** Trusted local ingress. Uses the same admission, dedupe, cancellation and settlement as guests. */
+	submitLocal(
+		principal: Principal,
+		request: ManagedCollabRequest,
+		notify: (receipt: ManagedCollabReceipt) => void,
+	): Promise<void> {
+		const work = this.#submit(principal, request, notify);
 		this.#pending.add(work);
 		void work.finally(() => this.#pending.delete(work)).catch(() => {});
 		return work;
@@ -247,8 +260,12 @@ export class ManagedCollabCoordinator<Principal> implements ManagedCollabAdmissi
 		}
 	}
 
-	async cancel(peer: number, target: ManagedCollabTurn): Promise<ManagedCollabReceipt> {
-		const principal = this.#principal(peer);
+	cancel(peer: symbol, target: ManagedCollabTurn): Promise<ManagedCollabReceipt> {
+		return this.cancelLocal(this.#principal(peer), target);
+	}
+
+	/** The embedder authenticates the principal; policy.cancel still authorizes the exact active turn. */
+	async cancelLocal(principal: Principal, target: ManagedCollabTurn): Promise<ManagedCollabReceipt> {
 		const active = this.#active;
 		const activeKey = this.#activeKey;
 		if (!active || !activeKey || active.requestId !== target.requestId || active.turnId !== target.turnId) {

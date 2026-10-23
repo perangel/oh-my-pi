@@ -152,25 +152,31 @@ async function crossPrincipalCancel(): Promise<void> {
 	const receiptsA: ManagedCollabReceipt[] = [];
 	const receiptsB: ManagedCollabReceipt[] = [];
 	let pendingA: Promise<void> | undefined;
+	const peerA = Symbol("A");
+	const peerB = Symbol("B");
+	const reconnectedA = Symbol("A reconnected");
+	const reconnectedB = Symbol("B reconnected");
 	try {
-		await coordinator.authenticate(1, "A", expected);
-		await coordinator.authenticate(2, "B", expected);
-		await coordinator.submit(2, { requestId: "x", text: "B's independently valid x", expected }, receipt =>
+		await coordinator.authenticate(peerA, "A", expected);
+		await coordinator.authenticate(peerB, "B", expected);
+		await coordinator.submit(peerB, { requestId: "x", text: "B's independently valid x", expected }, receipt =>
 			receiptsB.push(receipt),
 		);
-		const completedB = await coordinator.lookup(2, "x");
+		const completedB = await coordinator.lookup(peerB, "x");
 		assert.equal(completedB.phase, "completed");
 		assert.equal(completedB.turnId, "turn-B-x");
-		assert.deepEqual(await coordinator.lookup(1, "x"), { requestId: "x", phase: "unknown" });
-		pendingA = coordinator.submit(1, { requestId: "x", text: "A's independently valid x", expected }, receipt =>
-			receiptsA.push(receipt),
+		assert.deepEqual(await coordinator.lookupLocal("A", "x"), { requestId: "x", phase: "unknown" });
+		pendingA = coordinator.submitLocal(
+			"A",
+			{ requestId: "x", text: "A's independently valid x", expected },
+			receipt => receiptsA.push(receipt),
 		);
 		const signalA = await turnA.started;
 		const target = { requestId: "x", turnId: "turn-A-x" };
-		assert.deepEqual(await coordinator.cancel(2, target), { ...target, phase: "rejected", code: "denied" });
+		assert.deepEqual(await coordinator.cancel(peerB, target), { ...target, phase: "rejected", code: "denied" });
 		assert.equal(signalA.aborted, false, "policy denial must not abort A");
 		allowCancel = true;
-		const cancellation = await coordinator.cancel(2, target);
+		const cancellation = await coordinator.cancel(peerB, target);
 		assert.equal(signalA.aborted, true, "authorized B must abort A's actual native provider");
 		// Cancellation does not imply the embedder's settlement callback has finished.
 		// The pending response still MUST refer to A, never B's same-ID receipt.
@@ -184,16 +190,16 @@ async function crossPrincipalCancel(): Promise<void> {
 		assert.ok(manager.getEntries().some(entry => entry.id === settledA.settlementEntryId));
 		releaseSettlement.resolve();
 		await pendingA;
-		coordinator.forget(1);
-		coordinator.forget(2);
-		await coordinator.authenticate(3, "A", expected);
-		await coordinator.authenticate(4, "B", expected);
-		assert.deepEqual(await coordinator.lookup(3, "x"), settledA);
-		assert.deepEqual(await coordinator.lookup(4, "x"), completedB);
-		await coordinator.submit(3, { requestId: "x", text: "A's independently valid x", expected }, receipt =>
+		coordinator.forget(peerA);
+		coordinator.forget(peerB);
+		await coordinator.authenticate(reconnectedA, "A", expected);
+		await coordinator.authenticate(reconnectedB, "B", expected);
+		assert.deepEqual(await coordinator.lookup(reconnectedA, "x"), settledA);
+		assert.deepEqual(await coordinator.lookup(reconnectedB, "x"), completedB);
+		await coordinator.submit(reconnectedA, { requestId: "x", text: "A's independently valid x", expected }, receipt =>
 			receiptsA.push(receipt),
 		);
-		await coordinator.submit(4, { requestId: "x", text: "B's independently valid x", expected }, receipt =>
+		await coordinator.submitLocal("B", { requestId: "x", text: "B's independently valid x", expected }, receipt =>
 			receiptsB.push(receipt),
 		);
 		assert.equal(fixture.provider.calls.length, 2, "same-ID retries must not replay either principal's inference");
@@ -228,20 +234,24 @@ async function lateCancelAuthorization(): Promise<void> {
 	const receipts: ManagedCollabReceipt[] = [];
 	let pendingA: Promise<void> | undefined;
 	let pendingB: Promise<void> | undefined;
+	const peerA = Symbol("A");
+	const peerB = Symbol("B");
 	try {
-		await coordinator.authenticate(1, "A", expected);
-		await coordinator.authenticate(2, "B", expected);
-		pendingA = coordinator.submit(1, { requestId: "x", text: "A finishes during authorization", expected }, receipt =>
-			receipts.push(receipt),
+		await coordinator.authenticate(peerA, "A", expected);
+		await coordinator.authenticate(peerB, "B", expected);
+		pendingA = coordinator.submit(
+			peerA,
+			{ requestId: "x", text: "A finishes during authorization", expected },
+			receipt => receipts.push(receipt),
 		);
 		const signalA = await turnA.started;
 		const target = { requestId: "x", turnId: "turn-A-x" };
-		const cancellation = coordinator.cancel(2, target);
+		const cancellation = coordinator.cancelLocal("B", target);
 		await authorizationEntered.promise;
 		turnA.finish();
 		await pendingA;
 		assert.equal(signalA.aborted, false);
-		pendingB = coordinator.submit(2, { requestId: "x", text: "B's independent successor", expected }, receipt =>
+		pendingB = coordinator.submit(peerB, { requestId: "x", text: "B's independent successor", expected }, receipt =>
 			receipts.push(receipt),
 		);
 		const signalB = await turnB.started;
@@ -250,8 +260,8 @@ async function lateCancelAuthorization(): Promise<void> {
 		assert.equal(signalB.aborted, false, "late authorization must not abort B's same-request-ID successor");
 		turnB.finish();
 		await pendingB;
-		assert.equal((await coordinator.lookup(1, "x")).phase, "completed");
-		assert.equal((await coordinator.lookup(2, "x")).phase, "completed");
+		assert.equal((await coordinator.lookup(peerA, "x")).phase, "completed");
+		assert.equal((await coordinator.lookupLocal("B", "x")).phase, "completed");
 		assert.deepEqual(
 			receipts.map(receipt => [receipt.turnId, receipt.phase]),
 			[

@@ -42,7 +42,7 @@ export class CollabController {
 	readonly instanceId: string;
 	#ctx: InteractiveModeContext;
 	#generation = 0;
-	#managedMode = false;
+	#managed: ManagedCollabAdmission | undefined;
 	#host: CollabHost | undefined;
 	/** Serializes stop/start sequences so a rotation never interleaves with another. */
 	#ops: Promise<void> = Promise.resolve();
@@ -77,8 +77,18 @@ export class CollabController {
 	}
 
 	get autoStartMode(): CollabAutoStart {
-		if (this.#managedMode) return "off";
+		if (this.#managed) return "off";
 		return cfgCollabAutoStart.get(this.#ctx.settings);
+	}
+
+	/** Bind native managed ownership before UI initialization, without opening a relay room. */
+	bindManaged(managed: ManagedCollabAdmission): void {
+		if (this.#managed === managed) return;
+		if (this.#shutdown || this.#ctx.collabGuest) throw new CollabHostStoppedError("collab controller unavailable");
+		if (this.#managed || this.#host) throw new Error("Managed controller requires fresh ownership");
+		this.#managed = managed;
+		// Invalidate any unbound launch queued before ownership was established.
+		this.#stopEpoch++;
 	}
 
 	/**
@@ -139,8 +149,9 @@ export class CollabController {
 	async start(options: CollabStartOptions): Promise<CollabHost> {
 		if (this.#shutdown) throw new CollabHostStoppedError("collab controller shut down");
 		if (this.#ctx.collabGuest) throw new CollabHostStoppedError("collab guest owns the session");
-		if (this.#managedMode && !options.managed) throw new Error("Managed controller cannot start an unbound room");
-		if (options.managed) this.#managedMode = true;
+		if (this.#managed && options.managed !== this.#managed)
+			throw new Error("Managed controller cannot start an unbound or differently owned room");
+		if (options.managed) this.bindManaged(options.managed);
 		const existing = this.host;
 		if (options.managed && existing) throw new Error("Managed host requires a fresh room");
 		if (existing && (existing.access === "control" || options.access === "view")) return existing;

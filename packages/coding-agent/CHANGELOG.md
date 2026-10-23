@@ -5,6 +5,7 @@
 ### Added
 
 - Added opt-in managed native collaboration SDK hosting and bound guest launch with authenticated scope binding, busy rejection, correlated receipts, targeted cancellation, journal settlement and terminal-safe cleanup.
+- Added relay-independent local admission and lazy native room startup sharing one managed coordinator, with room-scoped peer identities and same-journal reentry.
 
 ### Fixed
 

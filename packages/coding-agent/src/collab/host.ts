@@ -548,7 +548,6 @@ export class CollabHost {
 
 	async #runStop(reason: string): Promise<void> {
 		this.#stopping = true;
-		this.#managed?.withdraw();
 		// Leave the public slot at once: `/collab` must not re-print, and `/join`
 		// must not see as hosting, a room that already refuses frames.
 		if (this.#ctx.collabHost === this) this.#ctx.collabHost = undefined;
@@ -573,7 +572,9 @@ export class CollabHost {
 	async #runTeardown(): Promise<void> {
 		if (this.#stopped) return;
 		this.#stopped = true;
-		this.#managed?.withdraw();
+		// The native owner, not an optional relay room, owns local admission.
+		for (const token of this.#authAttempts.values()) this.#managed?.forget(token);
+		this.#authAttempts.clear();
 		// A room that ended on its own (fatal relay close) reaches here without
 		// `#runStop`: leave the public slot before the first await as well.
 		if (this.#ctx.collabHost === this) this.#ctx.collabHost = undefined;
@@ -766,19 +767,20 @@ export class CollabHost {
 				}
 				const attempt = Symbol();
 				this.#authAttempts.set(peer, attempt);
-				await managed.authenticate(peer, hello.capability, identity);
+				await managed.authenticate(attempt, hello.capability, identity);
 				if (
 					this.#authAttempts.get(peer) !== attempt ||
 					!this.#socket?.isServing(peer) ||
 					!this.#guestTrafficAllowed()
 				) {
-					managed.forget(peer);
+					managed.forget(attempt);
 					return;
 				}
 				this.#handleHello(frame.name, frame.proto, frame.writeToken, peer);
 				return;
 			}
-			if (!this.#peers.has(peer)) throw new Error("authentication required");
+			const token = this.#authAttempts.get(peer);
+			if (!token || !this.#peers.has(peer)) throw new Error("authentication required");
 			if (frame.t !== "managed-prompt" && frame.t !== "managed-lookup" && frame.t !== "managed-cancel") {
 				this.#send({ t: "error", message: "Remote action denied by managed host" }, peer);
 				return;
@@ -810,10 +812,10 @@ export class CollabHost {
 				this.#send({ t: "managed-receipt", receipt }, peer);
 				this.#scheduleStateBroadcast();
 			};
-			if (frame.t === "managed-lookup") notify(await managed.lookup(peer, frame.requestId));
-			else if (frame.t === "managed-cancel") notify(await managed.cancel(peer, frame));
+			if (frame.t === "managed-lookup") notify(await managed.lookup(token, frame.requestId));
+			else if (frame.t === "managed-cancel") notify(await managed.cancel(token, frame));
 			else if (!this.#guestActionsReady()) notify({ requestId, phase: "rejected", code: "starting" });
-			else await managed.submit(peer, frame.request, notify);
+			else await managed.submit(token, frame.request, notify);
 		} catch {
 			// Authentication/policy errors may contain opaque credentials. Never log their text.
 			const requestId =
@@ -1093,7 +1095,7 @@ export class CollabHost {
 	 */
 	#handleRoomRecreated(): void {
 		if (this.#stopped) return;
-		for (const peer of this.#peers.keys()) this.#managed?.forget(peer);
+		for (const token of this.#authAttempts.values()) this.#managed?.forget(token);
 		this.#authAttempts.clear();
 		if (this.#peers.size === 0 && this.#pendingUi.size === 0) return;
 		// Identities first: settle() fans `ui-request-end` out over #peers, and those
@@ -1113,8 +1115,9 @@ export class CollabHost {
 
 	/** Identity and UI only: the socket already retired the peer and dropped its backlog. */
 	#handlePeerLeft(peer: number): void {
+		const token = this.#authAttempts.get(peer);
 		this.#authAttempts.delete(peer);
-		this.#managed?.forget(peer);
+		if (token) this.#managed?.forget(token);
 		const name = this.#peers.get(peer)?.name;
 		this.#peers.delete(peer);
 		// Relay controls arrive outside the normal frame handler.
